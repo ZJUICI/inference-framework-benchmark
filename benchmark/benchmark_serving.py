@@ -1,20 +1,3 @@
-"""Benchmark online serving throughput.
-
-On the server side, run one of the following commands:
-    (vLLM backend)
-    python -m vllm.entrypoints.api_server \
-        --model <your_model> --swap-space 16 \
-        --disable-log-requests
-
-    (TGI backend)
-    ./launch_hf_server.sh <your_model>
-
-On the client side, run:
-    python benchmarks/benchmark_serving.py \
-        --backend <backend> \
-        --tokenizer <your_model> --dataset <target_dataset> \
-        --request-rate <request_rate>
-"""
 import argparse
 import asyncio
 import json
@@ -234,7 +217,7 @@ def main(args: argparse.Namespace):
 
     api_url = f"http://{args.host}:{args.port}/generate"
     tokenizer = get_tokenizer(args.tokenizer, trust_remote_code=args.trust_remote_code)
-    global_datasets = tokenized_datasets(args.datasets, tokenizer)
+    global_datasets = tokenized_datasets(args.dataset, tokenizer)
     print("Tokenized datasets finished")
 
     metrics = [128, 512, 1024, 2048]
@@ -257,7 +240,7 @@ def main(args: argparse.Namespace):
         avg_latency_input_requests = sample_requests(
             input_length=input_len,
             output_length=output_len,
-            num_requests=args.num_prompts * 0.2,
+            num_requests=int(args.num_prompts * 0.2),
             dataset=global_datasets,
         )
 
@@ -278,7 +261,7 @@ def main(args: argparse.Namespace):
         throughput_input_requests = sample_requests(
             input_length=input_len,
             output_length=output_len,
-            num_requests=args.num_prompts * 0.8,
+            num_requests=int(args.num_prompts * 0.8),
             dataset=global_datasets,
         )
 
