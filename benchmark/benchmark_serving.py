@@ -3,6 +3,8 @@ import asyncio
 import json
 import random
 import time
+import warnings
+import pathlib
 from typing import AsyncGenerator, List, Tuple
 
 import aiohttp
@@ -12,10 +14,36 @@ from transformers import PreTrainedTokenizerBase
 from benchmark.transformers_utils.tokenizer import get_tokenizer
 
 
+class TableLog:
+    """markdown table log"""
+
+    def __init__(self, print=False) -> None:
+        self._text = ""
+        self._prt = print
+
+    @property
+    def text(self) -> str:
+        return self._text
+
+    def write(self, s: str):
+        self._text += s + "\n"
+        if self._prt:
+            print(s)
+
+    def save(self, p: str, mkdir=True):
+        pt = pathlib.Path(p).resolve().absolute()
+        if mkdir:
+            pt.parent.mkdir(parents=True, exist_ok=True)
+
+        pt.write_text(self._text)
+
+        print(f"Markdown result saved. path:{pt}")
+
+
 def tokenized_datasets(
     dataset_path: str,
     tokenizer: PreTrainedTokenizerBase,
-) -> List[Tuple[str, int, int]]:
+) -> List[List[int]]:
     # Load the dataset.
     with open(dataset_path) as f:
         dataset = json.load(f)
@@ -28,36 +56,57 @@ def tokenized_datasets(
     ]
 
     # Tokenize the prompts and completions.
+    print(f"Begin encoding the prompt string.")
+    encoding_s = time.perf_counter()
     prompts = [prompt for prompt, _ in dataset]
     prompt_token_ids = tokenizer(prompts).input_ids
-    completions = [completion for _, completion in dataset]
-    completion_token_ids = tokenizer(completions).input_ids
 
-    return [
-        (prompts[i], len(prompt_token_ids[i]), len(completion_token_ids[i]))
-        for i in range(len(prompts))
-    ]
+    # Unnecessary encode.
+    # completions = [completion for _, completion in dataset]
+    # completion_token_ids = tokenizer(completions).input_ids
+    print(
+        f"Encoding prompts string to token IDs completed. Time spent: {time.perf_counter() - encoding_s:.4f}s"
+    )
+    return prompt_token_ids
 
 
 def sample_requests(
     input_length: int,
     output_length: int,
     num_requests: int,
-    dataset: List[Tuple[str, int, int]],
+    # dataset: List[Tuple[str, int, int]],
+    dataset: List[List[int]],
+    tokenizer: PreTrainedTokenizerBase,
 ) -> List[Tuple[str, int, int]]:
     filtered_dataset: List[Tuple[str, int, int]] = []
-    for prompt, prompt_len, completion_len in dataset:
-        if prompt_len < 4 or completion_len < 4:
+
+    print(f"filter requests by input length:{input_length}")
+    s = time.perf_counter()
+    for prompt_token_id in dataset:
+        if len(prompt_token_id) < input_length:
             continue
-        if (
-            prompt_len > 2048
-            or prompt_len not in range(input_length - 50, input_length + 50)
-            or prompt_len + output_length > 4096
+        elif len(prompt_token_id) in range(
+            input_length, input_length + input_length // 2
         ):
-            continue
-        filtered_dataset.append((prompt, prompt_len, output_length))
+            # NOTE: split prompt ids by input length
+            filtered_dataset.append(
+                (
+                    tokenizer.decode(
+                        prompt_token_id[:input_length], skip_special_tokens=True
+                    ),
+                    input_length,
+                    output_length,
+                )
+            )
+    print(f"Filtered requests completed, time spent: {time.perf_counter() - s:.4f}s")
     # Sample the requests.
+    if len(filtered_dataset) < num_requests:
+        warnings.warn(
+            f"The number of requests {num_requests} is larger than the dataset length: {len(filtered_dataset)}, so it has been automatically set to {len(filtered_dataset)}"
+        )
+        return filtered_dataset
     sampled_requests = random.sample(filtered_dataset, num_requests)
+
     return sampled_requests
 
 
@@ -195,7 +244,7 @@ async def benchmark(
 ) -> None:
     tasks: List[asyncio.Task] = []
     async for request in get_request(input_requests, request_rate):
-        prompt, prompt_len, output_len = request
+        prompt, _, output_len = request
         task = asyncio.create_task(
             send_request(
                 backend,
@@ -211,6 +260,7 @@ async def benchmark(
 
 
 def main(args: argparse.Namespace):
+    tl = TableLog()
     print(args)
     random.seed(args.seed)
     np.random.seed(args.seed)
@@ -220,16 +270,28 @@ def main(args: argparse.Namespace):
     global_datasets = tokenized_datasets(args.dataset, tokenizer)
     print("Tokenized datasets finished")
 
-    metrics = [128, 512, 1024, 2048]
+    metrics_extract = lambda x: [int(i) for i in x.split(",")]
+
+    metrics_in = metrics_extract(args.input_lengths)
+    print(f"input lengths {metrics_in} ")
+
+    if not args.output_lengths:
+        print(f"Output lengths are not passed, set to be the same as input lengths.")
+        metrics_out = metrics_in
+    else:
+        metrics_out = metrics_extract(args.output_lengths)
+    print(f"output lengths {metrics_out} ")
     benchmark_metrics = [
-        (input_len, output_len) for input_len in metrics for output_len in metrics
+        (input_len, output_len)
+        for input_len in metrics_in
+        for output_len in metrics_out
     ]
 
-    print(
+    tl.write(
         "| Input Length | Output Length | Throughput (requests/s) | Throughput (output token/s) "
         "| Average latency per token (ms) | Average latency per output token (ms) |"
     )
-    print(
+    tl.write(
         "|:------------:|:-------------:|:-----------------------:|:---------------------------:"
         "|:------------------------------:|:-------------------------------------:|"
     )
@@ -237,11 +299,16 @@ def main(args: argparse.Namespace):
     for input_len, output_len in benchmark_metrics:
         # 20% of num_prompts are used to test latency,
         # while 80% are used to test throughput.
+        print(
+            f"Start making requests one by one, with input length: {input_len} and output length: {output_len}."
+        )
         avg_latency_input_requests = sample_requests(
             input_length=input_len,
             output_length=output_len,
-            num_requests=int(args.num_prompts * 0.2),
+            # num_requests=int(args.num_prompts * 0.2),
+            num_requests=int(args.obo_num),
             dataset=global_datasets,
+            tokenizer=tokenizer,
         )
 
         # Process requests one by one to prevent queue congestion.
@@ -256,13 +323,16 @@ def main(args: argparse.Namespace):
             max_new_tokens=output_len,
             prompt_requests=avg_latency_input_requests,
         )
-
+        print(
+            f"Begin benchmarks for input length:{input_len} and output length:{output_len}."
+        )
         # Filter out 80% of the requests for testing throughput.
         throughput_input_requests = sample_requests(
             input_length=input_len,
             output_length=output_len,
-            num_requests=int(args.num_prompts * 0.8),
+            num_requests=int(args.num_prompts),
             dataset=global_datasets,
+            tokenizer=tokenizer,
         )
 
         benchmark_start_time = time.perf_counter()
@@ -281,15 +351,20 @@ def main(args: argparse.Namespace):
 
         # throughput_requests: Throughput (requests/s)
         # throughput_output_tokens: Throughput (output token/s)
-        throughput_requests = f"{(args.num_prompts * 0.8) / benchmark_time:.2f}"
+        throughput_requests = f"{(args.num_prompts) / benchmark_time:.2f}"
         throughput_output_tokens = (
-            f"{(args.num_prompts * 0.8 * output_len) / benchmark_time:.2f}"
+            f"{(args.num_prompts * output_len) / benchmark_time:.2f}"
         )
 
-        print(
+        tl.write(
             f"|{input_len}|{output_len}|{throughput_requests}|{throughput_output_tokens}"
             f"|{avg_per_token_latency*1000:.2f}|{avg_per_output_token_latency*1000:.2f}|"
         )
+
+        print(tl.text)
+
+    if args.output:
+        tl.save(args.output)
 
 
 if __name__ == "__main__":
@@ -329,6 +404,31 @@ if __name__ == "__main__":
         "--trust-remote-code",
         action="store_true",
         help="trust remote code from huggingface",
+    )
+
+    parser.add_argument(
+        "--obo-num",
+        type=int,
+        help="Number of send one by one request",
+    )
+
+    parser.add_argument(
+        "--input-lengths",
+        type=str,
+        default="128,512,1024,2048",
+        help="The input length of prompts, separated by ','",
+    )
+
+    parser.add_argument(
+        "--output-lengths",
+        type=str,
+        help="The output length of max new tokens, separated by ','",
+    )
+
+    parser.add_argument(
+        "--output",
+        type=str,
+        help="Output path for saving the metrics table as markdown.",
     )
     args = parser.parse_args()
     main(args)
