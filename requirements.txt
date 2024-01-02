@@ -1,6 +1,4 @@
 aiohttp
-fastapi
 loguru >= 0.7.2
 transformers >= 4.36.0
 sentencepiece
-uvicorn[standard]
