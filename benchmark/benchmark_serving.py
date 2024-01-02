@@ -13,6 +13,11 @@ import requests
 from transformers import PreTrainedTokenizerBase
 from benchmark.transformers_utils.tokenizer import get_tokenizer
 
+from loguru import logger
+
+
+
+GENERATED_TOKENS:List[int] = []
 
 class TableLog:
     """markdown table log"""
@@ -28,7 +33,7 @@ class TableLog:
     def write(self, s: str):
         self._text += s + "\n"
         if self._prt:
-            print(s)
+            logger.info(s)
 
     def save(self, p: str, mkdir=True):
         pt = pathlib.Path(p).resolve().absolute()
@@ -37,7 +42,7 @@ class TableLog:
 
         pt.write_text(self._text)
 
-        print(f"Markdown result saved. path:{pt}")
+        logger.info(f"Markdown result saved. path:{pt}")
 
 
 def tokenized_datasets(
@@ -56,7 +61,7 @@ def tokenized_datasets(
     ]
 
     # Tokenize the prompts and completions.
-    print(f"Begin encoding the prompt string.")
+    logger.info(f"Begin encoding the prompt string.")
     encoding_s = time.perf_counter()
     prompts = [prompt for prompt, _ in dataset]
     prompt_token_ids = tokenizer(prompts).input_ids
@@ -64,7 +69,7 @@ def tokenized_datasets(
     # Unnecessary encode.
     # completions = [completion for _, completion in dataset]
     # completion_token_ids = tokenizer(completions).input_ids
-    print(
+    logger.info(
         f"Encoding prompts string to token IDs completed. Time spent: {time.perf_counter() - encoding_s:.4f}s"
     )
     return prompt_token_ids
@@ -80,7 +85,7 @@ def sample_requests(
 ) -> List[Tuple[str, int, int]]:
     filtered_dataset: List[Tuple[str, int, int]] = []
 
-    print(f"filter requests by input length:{input_length}")
+    logger.info(f"filter requests by input length:{input_length}")
     s = time.perf_counter()
     for prompt_token_id in dataset:
         if len(prompt_token_id) < input_length:
@@ -98,7 +103,7 @@ def sample_requests(
                     output_length,
                 )
             )
-    print(f"Filtered requests completed, time spent: {time.perf_counter() - s:.4f}s")
+    logger.info(f"Filtered requests completed, time spent: {time.perf_counter() - s:.4f}s")
     # Sample the requests.
     if len(filtered_dataset) < num_requests:
         warnings.warn(
@@ -154,11 +159,16 @@ async def send_request(
             "best_of": best_of,
             "max_new_tokens": output_len,
             "do_sample": True,
+            "details":True
         }
         pload = {
             "inputs": prompt,
             "parameters": params,
         }
+    elif backend == "trt":
+        # TODO(zt): triton trt llm backend implementations
+        # see  https://github.com/triton-inference-server/tensorrtllm_backend
+        raise NotImplementedError(f"The TRT backend is currently not supported.")
     else:
         raise ValueError(f"Unknown backend: {backend}")
 
@@ -174,7 +184,15 @@ async def send_request(
 
             # Re-send the request if it failed.
             if "error" not in output:
+                global GENERATED_TOKENS 
+                generated_tokens = output_len
+                if backend == "tgi":
+                    generated_tokens = output["details"]["generated_tokens"]
+                
+                GENERATED_TOKENS.append(generated_tokens)
                 break
+
+            
 
 
 def send_request_one_by_one(
@@ -186,7 +204,9 @@ def send_request_one_by_one(
     max_new_tokens: int,
     prompt_requests: List[Tuple[str, int, int]],
 ):
-    request_latency: List[float] = []
+    # request_latency: List[float] = []
+    request_latency: List[Tuple(float,int)] = []
+
     for prompt, _, _ in prompt_requests:
         request_start_time = time.perf_counter()
         headers = {"User-Agent": "Benchmark Client"}
@@ -204,31 +224,46 @@ def send_request_one_by_one(
             }
         elif backend == "tgi":
             assert not use_beam_search
+            # NOTE(zt): For TGI, the HTTP router doesn't support the `ignore_eos`` parameter. 
+            # However, TGI can use `details:True` to get the token count in the response. 
+            # So, we might think about using this count to calculate token latency.
             params = {
                 "best_of": best_of,
                 "max_new_tokens": max_new_tokens,
                 "do_sample": True,
+                "details":True
             }
             pload = {
                 "inputs": prompt,
                 "parameters": params,
             }
+        elif backend == "trt":
+            # TODO(zt): triton trt llm backend implementations
+            # see  https://github.com/triton-inference-server/tensorrtllm_backend
+            raise NotImplementedError(f"Unknown backend: {backend}")
         else:
             raise ValueError(f"Unknown backend: {backend}")
         while True:
             response = requests.post(url, json=pload, headers=headers)
             if response.status_code == 200 and "error" not in response.json():
+                # TODO: if backend is tgi, get the generated token count from `response.json()["details"]["generated_tokens"]`
+                generated_tokens = max_new_tokens
+                if backend == "tgi":
+                    generated_tokens = response.json()["details"]["generated_tokens"]
+                
                 break
+
         request_end_time = time.perf_counter()
         elapsed = request_end_time - request_start_time
-        request_latency.append(elapsed)
+        # request_latency.append(elapsed)
+        request_latency.append((elapsed,generated_tokens))
 
     # Compute the latency statistics.
     _avg_per_token_latency = np.mean(
-        [latency / (input_prompt_len + max_new_tokens) for latency in request_latency]
+        [latency / (input_prompt_len + generated_token) for latency, generated_token in request_latency]
     )
     _avg_per_output_token_latency = np.mean(
-        [latency / max_new_tokens for latency in request_latency]
+        [latency / generated_token for latency,generated_token in request_latency]
     )
 
     return _avg_per_token_latency, _avg_per_output_token_latency
@@ -261,26 +296,26 @@ async def benchmark(
 
 def main(args: argparse.Namespace):
     tl = TableLog()
-    print(args)
+    logger.info(args)
     random.seed(args.seed)
     np.random.seed(args.seed)
 
     api_url = f"http://{args.host}:{args.port}/generate"
     tokenizer = get_tokenizer(args.tokenizer, trust_remote_code=args.trust_remote_code)
     global_datasets = tokenized_datasets(args.dataset, tokenizer)
-    print("Tokenized datasets finished")
+    logger.info("Tokenized datasets finished")
 
     metrics_extract = lambda x: [int(i) for i in x.split(",")]
 
     metrics_in = metrics_extract(args.input_lengths)
-    print(f"input lengths {metrics_in} ")
+    logger.info(f"input lengths {metrics_in} ")
 
     if not args.output_lengths:
-        print(f"Output lengths are not passed, set to be the same as input lengths.")
+        logger.info(f"Output lengths are not passed, set to be the same as input lengths.")
         metrics_out = metrics_in
     else:
         metrics_out = metrics_extract(args.output_lengths)
-    print(f"output lengths {metrics_out} ")
+    logger.info(f"output lengths {metrics_out} ")
     benchmark_metrics = [
         (input_len, output_len)
         for input_len in metrics_in
@@ -299,7 +334,7 @@ def main(args: argparse.Namespace):
     for input_len, output_len in benchmark_metrics:
         # 20% of num_prompts are used to test latency,
         # while 80% are used to test throughput.
-        print(
+        logger.info(
             f"Start making requests one by one, with input length: {input_len} and output length: {output_len}."
         )
         avg_latency_input_requests = sample_requests(
@@ -323,7 +358,7 @@ def main(args: argparse.Namespace):
             max_new_tokens=output_len,
             prompt_requests=avg_latency_input_requests,
         )
-        print(
+        logger.info(
             f"Begin benchmarks for input length:{input_len} and output length:{output_len}."
         )
         # Filter out 80% of the requests for testing throughput.
@@ -334,7 +369,8 @@ def main(args: argparse.Namespace):
             dataset=global_datasets,
             tokenizer=tokenizer,
         )
-
+        global GENERATED_TOKENS
+        GENERATED_TOKENS = []
         benchmark_start_time = time.perf_counter()
         asyncio.run(
             benchmark(
@@ -352,16 +388,24 @@ def main(args: argparse.Namespace):
         # throughput_requests: Throughput (requests/s)
         # throughput_output_tokens: Throughput (output token/s)
         throughput_requests = f"{(args.num_prompts) / benchmark_time:.2f}"
+
+        #
+        # throughput_output_tokens = (
+        #     f"{(args.num_prompts * output_len) / benchmark_time:.2f}"
+        # )   
+        
+        # all output length / all time
         throughput_output_tokens = (
-            f"{(args.num_prompts * output_len) / benchmark_time:.2f}"
+            f"{sum(GENERATED_TOKENS) / benchmark_time:.2f}"
         )
 
+        # 
         tl.write(
             f"|{input_len}|{output_len}|{throughput_requests}|{throughput_output_tokens}"
             f"|{avg_per_token_latency*1000:.2f}|{avg_per_output_token_latency*1000:.2f}|"
         )
 
-        print(tl.text)
+        logger.info(f"\n{tl.text}")
 
     if args.output:
         tl.save(args.output)
