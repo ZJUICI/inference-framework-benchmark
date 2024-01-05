@@ -166,9 +166,14 @@ async def send_request(
             "parameters": params,
         }
     elif backend == "trt":
-        # TODO(zt): triton trt llm backend implementations
-        # see  https://github.com/triton-inference-server/tensorrtllm_backend
-        raise NotImplementedError(f"The TRT backend is currently not supported.")
+        pload = {
+            "text_input":prompt,
+            "max_tokens":output_len,
+            "bad_words": "", 
+            # NOTE: Empty `stop_words` and `end_id` can make server generated tokens extend to the `max_tokens` limit.
+            "stop_words": "",
+            "temperature": 0.01
+        }  
     else:
         raise ValueError(f"Unknown backend: {backend}")
 
@@ -204,7 +209,7 @@ def send_request_one_by_one(
     max_new_tokens: int,
     prompt_requests: List[Tuple[str, int, int]],
 ):
-    # request_latency: List[float] = []
+
     request_latency: List[Tuple(float,int)] = []
 
     for prompt, _, _ in prompt_requests:
@@ -238,15 +243,19 @@ def send_request_one_by_one(
                 "parameters": params,
             }
         elif backend == "trt":
-            # TODO(zt): triton trt llm backend implementations
-            # see  https://github.com/triton-inference-server/tensorrtllm_backend
-            raise NotImplementedError(f"Unknown backend: {backend}")
+            pload = {
+                "text_input":prompt,
+                "max_tokens":max_new_tokens,
+                "bad_words": "", 
+                # NOTE: Empty `stop_words` and `end_id` can make server generated tokens extend to the `max_tokens` limit.
+                "stop_words": "",
+                "temperature": 0.01
+            }
         else:
             raise ValueError(f"Unknown backend: {backend}")
         while True:
             response = requests.post(url, json=pload, headers=headers)
             if response.status_code == 200 and "error" not in response.json():
-                # TODO: if backend is tgi, get the generated token count from `response.json()["details"]["generated_tokens"]`
                 generated_tokens = max_new_tokens
                 if backend == "tgi":
                     generated_tokens = response.json()["details"]["generated_tokens"]
@@ -301,6 +310,11 @@ def main(args: argparse.Namespace):
     np.random.seed(args.seed)
 
     api_url = f"http://{args.host}:{args.port}/generate"
+
+    if args.backend == "trt":
+        # TODO: get model name by args named trt-model?
+        api_url = f"http://{args.host}:{args.port}/v2/models/ensemble/generate"
+    
     tokenizer = get_tokenizer(args.tokenizer, trust_remote_code=args.trust_remote_code)
     global_datasets = tokenized_datasets(args.dataset, tokenizer)
     logger.info("Tokenized datasets finished")
@@ -415,7 +429,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(
         description="Benchmark the online serving throughput."
     )
-    parser.add_argument("--backend", type=str, default="vllm", choices=["vllm", "tgi"])
+    parser.add_argument("--backend", type=str, default="vllm", choices=["vllm", "tgi","trt"])
     parser.add_argument("--host", type=str, default="localhost")
     parser.add_argument("--port", type=int, default=8000)
     parser.add_argument(
