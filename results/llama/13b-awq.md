@@ -1,6 +1,8 @@
 
 # TheBloke/WizardLM-13B-V1.2-AWQ
 
+## A100 40G
+
 ## vllm 0.2.5
 
 | Input Length | Output Length | Throughput (requests/s) | Throughput (output token/s) | Average latency per token (ms) | Average latency per output token (ms) |
