@@ -1,5 +1,7 @@
 # Mistral-7B-OpenOrca-GPTQ
 
+## A100 40G
+
 ## vllm v0.2.5
 
 | Input Length | Output Length | Throughput (requests/s) | Throughput (output token/s) | Average latency per token (ms) | Average latency per output token (ms) |
