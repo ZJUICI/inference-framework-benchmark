@@ -9,6 +9,7 @@ from typing import AsyncGenerator, List, Tuple
 
 import aiohttp
 import numpy as np
+
 import requests
 from transformers import PreTrainedTokenizerBase
 from benchmark.transformers_utils.tokenizer import get_tokenizer
@@ -16,13 +17,13 @@ from benchmark.transformers_utils.tokenizer import get_tokenizer
 from loguru import logger
 
 
+GENERATED_TOKENS: List[int] = []
 
-GENERATED_TOKENS:List[int] = []
 
 class TableLog:
     """markdown table log"""
 
-    def __init__(self, print=False) -> None:
+    def __init__(self, print: bool = False) -> None:
         self._text = ""
         self._prt = print
 
@@ -30,12 +31,12 @@ class TableLog:
     def text(self) -> str:
         return self._text
 
-    def write(self, s: str):
+    def write(self, s: str) -> None:
         self._text += s + "\n"
         if self._prt:
             logger.info(s)
 
-    def save(self, p: str, mkdir=True):
+    def save(self, p: str, mkdir: bool = True) -> None:
         pt = pathlib.Path(p).resolve().absolute()
         if mkdir:
             pt.parent.mkdir(parents=True, exist_ok=True)
@@ -66,28 +67,23 @@ def tokenized_datasets(
     prompts = [prompt for prompt, _ in dataset]
     prompt_token_ids = tokenizer(prompts).input_ids
 
-    # Unnecessary encode.
-    # completions = [completion for _, completion in dataset]
-    # completion_token_ids = tokenizer(completions).input_ids
     logger.info(
         f"Encoding prompts string to token IDs completed. Time spent: {time.perf_counter() - encoding_s:.4f}s"
     )
     return prompt_token_ids
 
 
-def sample_requests(
+def filter_requests(
     input_length: int,
-    output_length: int,
-    num_requests: int,
-    # dataset: List[Tuple[str, int, int]],
-    dataset: List[List[int]],
+    prompt_token_ids: List[List[int]],
     tokenizer: PreTrainedTokenizerBase,
-) -> List[Tuple[str, int, int]]:
-    filtered_dataset: List[Tuple[str, int, int]] = []
+) -> List[str]:
+    """filter and split dataset  by input length"""
+    filtered_dataset: List[str] = []
 
     logger.info(f"filter requests by input length:{input_length}")
     s = time.perf_counter()
-    for prompt_token_id in dataset:
+    for prompt_token_id in prompt_token_ids:
         if len(prompt_token_id) < input_length:
             continue
         elif len(prompt_token_id) in range(
@@ -95,24 +91,43 @@ def sample_requests(
         ):
             # NOTE: split prompt ids by input length
             filtered_dataset.append(
-                (
-                    tokenizer.decode(
-                        prompt_token_id[:input_length], skip_special_tokens=True
-                    ),
-                    input_length,
-                    output_length,
+                tokenizer.decode(
+                    prompt_token_id[:input_length], skip_special_tokens=True
                 )
             )
-    logger.info(f"Filtered requests completed, time spent: {time.perf_counter() - s:.4f}s")
-    # Sample the requests.
-    if len(filtered_dataset) < num_requests:
-        warnings.warn(
-            f"The number of requests {num_requests} is larger than the dataset length: {len(filtered_dataset)}, so it has been automatically set to {len(filtered_dataset)}"
-        )
-        return filtered_dataset
-    sampled_requests = random.sample(filtered_dataset, num_requests)
+    logger.info(
+        f"Filtered requests completed, time spent: {time.perf_counter() - s:.4f}s"
+    )
 
+    return filtered_dataset
+
+
+def sample_requests(
+    filter_datasets: List[str], num_requests: int
+) -> List[Tuple[str, int, int]]:
+    """sample the datasets by num requests"""
+
+    # Sample the requests.
+    if len(filter_datasets) < num_requests:
+        warnings.warn(
+            f"The number of requests {num_requests} is larger than the dataset length: {len(filter_datasets)}, "
+            f"so it has been automatically set to {len(filter_datasets)}"
+        )
+
+        return filter_datasets
+
+    sampled_requests = random.sample(filter_datasets, num_requests)
     return sampled_requests
+
+
+def datasets_combinations(
+    datasets: List[str], num_prompts: int, input_length: int, output_length: int
+) -> List[Tuple[str, int, int]]:
+    """combine the datasets by input length and output length"""
+    return [
+        (dataset, input_length, output_length)
+        for dataset in sample_requests(datasets, num_prompts)
+    ]
 
 
 async def get_request(
@@ -132,15 +147,10 @@ async def get_request(
         await asyncio.sleep(interval)
 
 
-async def send_request(
-    backend: str,
-    api_url: str,
-    prompt: str,
-    output_len: int,
-    best_of: int,
-    use_beam_search: bool,
-) -> None:
-    headers = {"User-Agent": "Benchmark Client"}
+def make_request_body(
+    backend: str, prompt: str, best_of: int, use_beam_search: bool, output_len: int
+) -> dict:
+    """make request body by backend and some parameters"""
     if backend == "vllm":
         pload = {
             "prompt": prompt,
@@ -159,7 +169,7 @@ async def send_request(
             "best_of": best_of,
             "max_new_tokens": output_len,
             "do_sample": True,
-            "details":True
+            "details": True,
         }
         pload = {
             "inputs": prompt,
@@ -167,17 +177,32 @@ async def send_request(
         }
     elif backend == "trt":
         pload = {
-            "text_input":prompt,
-            "max_tokens":output_len,
-            "bad_words": "", 
+            "text_input": prompt,
+            "max_tokens": output_len,
+            "bad_words": "",
             # NOTE: Empty `stop_words` and `end_id` can make server generated tokens extend to the `max_tokens` limit.
             "stop_words": "",
-            "temperature": 0.01
-        }  
+            "temperature": 0.01,
+        }
     else:
         raise ValueError(f"Unknown backend: {backend}")
 
+    return pload
+
+
+async def send_request_async(
+    backend: str,
+    api_url: str,
+    prompt: str,
+    output_len: int,
+    best_of: int,
+    use_beam_search: bool,
+) -> None:
+    headers = {"User-Agent": "Benchmark Client"}
+    pload = make_request_body(backend, prompt, best_of, use_beam_search, output_len)
+
     timeout = aiohttp.ClientTimeout(total=3 * 3600)
+
     async with aiohttp.ClientSession(timeout=timeout) as session:
         while True:
             async with session.post(api_url, headers=headers, json=pload) as response:
@@ -189,15 +214,44 @@ async def send_request(
 
             # Re-send the request if it failed.
             if "error" not in output:
-                global GENERATED_TOKENS 
+                global GENERATED_TOKENS
                 generated_tokens = output_len
                 if backend == "tgi":
                     generated_tokens = output["details"]["generated_tokens"]
-                
+
                 GENERATED_TOKENS.append(generated_tokens)
                 break
 
-            
+
+def send_request_sync(
+    backend: str,
+    api_url: str,
+    prompt: Tuple[str, int, int],
+    output_len: int,
+    best_of: int,
+    use_beam_search: bool,
+) -> List[Tuple[float, int]]:
+    headers = {"User-Agent": "Benchmark Client"}
+    pload = make_request_body(backend, prompt[0], best_of, use_beam_search, output_len)
+
+    request_latency: List[Tuple[float, int]] = []
+
+    while True:
+        request_start_time = time.perf_counter()
+        response = requests.post(api_url, json=pload, headers=headers)
+
+        if response.status_code == 200 and "error" not in response.json():
+            generated_tokens = output_len
+            if backend == "tgi":
+                generated_tokens = response.json()["details"]["generated_tokens"]
+
+            elapsed = time.perf_counter() - request_start_time
+
+            request_latency.append((elapsed, generated_tokens))
+
+            break
+
+    return request_latency
 
 
 def send_request_one_by_one(
@@ -208,71 +262,26 @@ def send_request_one_by_one(
     input_prompt_len: int,
     max_new_tokens: int,
     prompt_requests: List[Tuple[str, int, int]],
-):
-
-    request_latency: List[Tuple(float,int)] = []
-
-    for prompt, _, _ in prompt_requests:
-        request_start_time = time.perf_counter()
-        headers = {"User-Agent": "Benchmark Client"}
-        if backend == "vllm":
-            pload = {
-                "prompt": prompt,
-                "n": 1,
-                "best_of": best_of,
-                "use_beam_search": use_beam_search,
-                "temperature": 0.0 if use_beam_search else 1.0,
-                "top_p": 1.0,
-                "max_tokens": max_new_tokens,
-                "ignore_eos": True,
-                "stream": False,
-            }
-        elif backend == "tgi":
-            assert not use_beam_search
-            # NOTE(zt): For TGI, the HTTP router doesn't support the `ignore_eos`` parameter. 
-            # However, TGI can use `details:True` to get the token count in the response. 
-            # So, we might think about using this count to calculate token latency.
-            params = {
-                "best_of": best_of,
-                "max_new_tokens": max_new_tokens,
-                "do_sample": True,
-                "details":True
-            }
-            pload = {
-                "inputs": prompt,
-                "parameters": params,
-            }
-        elif backend == "trt":
-            pload = {
-                "text_input":prompt,
-                "max_tokens":max_new_tokens,
-                "bad_words": "", 
-                # NOTE: Empty `stop_words` and `end_id` can make server generated tokens extend to the `max_tokens` limit.
-                "stop_words": "",
-                "temperature": 0.01
-            }
-        else:
-            raise ValueError(f"Unknown backend: {backend}")
-        while True:
-            response = requests.post(url, json=pload, headers=headers)
-            if response.status_code == 200 and "error" not in response.json():
-                generated_tokens = max_new_tokens
-                if backend == "tgi":
-                    generated_tokens = response.json()["details"]["generated_tokens"]
-                
-                break
-
-        request_end_time = time.perf_counter()
-        elapsed = request_end_time - request_start_time
-        # request_latency.append(elapsed)
-        request_latency.append((elapsed,generated_tokens))
+) -> (float, float):
+    for prompt in prompt_requests:
+        request_latency = send_request_sync(
+            backend=backend,
+            api_url=url,
+            prompt=prompt,
+            output_len=max_new_tokens,
+            best_of=best_of,
+            use_beam_search=use_beam_search,
+        )
 
     # Compute the latency statistics.
     _avg_per_token_latency = np.mean(
-        [latency / (input_prompt_len + generated_token) for latency, generated_token in request_latency]
+        [
+            latency / (input_prompt_len + generated_token)
+            for latency, generated_token in request_latency
+        ]
     )
     _avg_per_output_token_latency = np.mean(
-        [latency / generated_token for latency,generated_token in request_latency]
+        [latency / generated_token for latency, generated_token in request_latency]
     )
 
     return _avg_per_token_latency, _avg_per_output_token_latency
@@ -290,7 +299,7 @@ async def benchmark(
     async for request in get_request(input_requests, request_rate):
         prompt, _, output_len = request
         task = asyncio.create_task(
-            send_request(
+            send_request_async(
                 backend,
                 api_url,
                 prompt,
@@ -303,20 +312,20 @@ async def benchmark(
     await asyncio.gather(*tasks)
 
 
-def main(args: argparse.Namespace):
+def main(args: argparse.Namespace) -> None:
     tl = TableLog()
     logger.info(args)
-    random.seed(args.seed)
-    np.random.seed(args.seed)
+    # random.seed(args.seed)
+    # np.random.seed(args.seed)
 
     api_url = f"http://{args.host}:{args.port}/generate"
 
     if args.backend == "trt":
-        # TODO: get model name by args named trt-model?
+        # NOTE(zt): get model name by args named trt-model?
         api_url = f"http://{args.host}:{args.port}/v2/models/ensemble/generate"
-    
+
     tokenizer = get_tokenizer(args.tokenizer, trust_remote_code=args.trust_remote_code)
-    global_datasets = tokenized_datasets(args.dataset, tokenizer)
+    prompt_token_ids = tokenized_datasets(args.dataset, tokenizer)
     logger.info("Tokenized datasets finished")
 
     metrics_extract = lambda x: [int(i) for i in x.split(",")]
@@ -325,16 +334,14 @@ def main(args: argparse.Namespace):
     logger.info(f"input lengths {metrics_in} ")
 
     if not args.output_lengths:
-        logger.info(f"Output lengths are not passed, set to be the same as input lengths.")
+        logger.info(
+            f"Output lengths are not passed, set to be the same as input lengths."
+        )
         metrics_out = metrics_in
     else:
         metrics_out = metrics_extract(args.output_lengths)
+
     logger.info(f"output lengths {metrics_out} ")
-    benchmark_metrics = [
-        (input_len, output_len)
-        for input_len in metrics_in
-        for output_len in metrics_out
-    ]
 
     tl.write(
         "| Input Length | Output Length | Throughput (requests/s) | Throughput (output token/s) "
@@ -345,81 +352,84 @@ def main(args: argparse.Namespace):
         "|:------------------------------:|:-------------------------------------:|"
     )
 
-    for input_len, output_len in benchmark_metrics:
-        # 20% of num_prompts are used to test latency,
-        # while 80% are used to test throughput.
-        logger.info(
-            f"Start making requests one by one, with input length: {input_len} and output length: {output_len}."
-        )
-        avg_latency_input_requests = sample_requests(
-            input_length=input_len,
-            output_length=output_len,
-            # num_requests=int(args.num_prompts * 0.2),
-            num_requests=int(args.obo_num),
-            dataset=global_datasets,
-            tokenizer=tokenizer,
-        )
-
-        # Process requests one by one to prevent queue congestion.
-        #   avg_per_token_latency: Average latency per token (ms)
-        #   avg_per_output_token_latency: Average latency per output token (ms)
-        avg_per_token_latency, avg_per_output_token_latency = send_request_one_by_one(
-            url=api_url,
-            backend=args.backend,
-            best_of=args.best_of,
-            use_beam_search=args.use_beam_search,
-            input_prompt_len=input_len,
-            max_new_tokens=output_len,
-            prompt_requests=avg_latency_input_requests,
-        )
-        logger.info(
-            f"Begin benchmarks for input length:{input_len} and output length:{output_len}."
-        )
-        # Filter out 80% of the requests for testing throughput.
-        throughput_input_requests = sample_requests(
-            input_length=input_len,
-            output_length=output_len,
-            num_requests=int(args.num_prompts),
-            dataset=global_datasets,
-            tokenizer=tokenizer,
-        )
-        global GENERATED_TOKENS
-        GENERATED_TOKENS = []
-        benchmark_start_time = time.perf_counter()
-        asyncio.run(
-            benchmark(
-                args.backend,
-                api_url,
-                throughput_input_requests,
-                args.best_of,
-                args.use_beam_search,
-                args.request_rate,
+    datasets_in = None
+    global GENERATED_TOKENS
+    for input_len in metrics_in:
+        for output_len in metrics_out:
+            logger.info(
+                f"Start making requests one by one, with input length: {input_len} and output length: {output_len}."
             )
-        )
-        benchmark_end_time = time.perf_counter()
-        benchmark_time = benchmark_end_time - benchmark_start_time
 
-        # throughput_requests: Throughput (requests/s)
-        # throughput_output_tokens: Throughput (output token/s)
-        throughput_requests = f"{(args.num_prompts) / benchmark_time:.2f}"
+            # get one by one request dataset for input length
+            if not datasets_in:
+                datasets_in = filter_requests(
+                    input_length=input_len,
+                    prompt_token_ids=prompt_token_ids,
+                    tokenizer=tokenizer,
+                )
 
-        #
-        # throughput_output_tokens = (
-        #     f"{(args.num_prompts * output_len) / benchmark_time:.2f}"
-        # )   
-        
-        # all output length / all time
-        throughput_output_tokens = (
-            f"{sum(GENERATED_TOKENS) / benchmark_time:.2f}"
-        )
+            filtered_requests = datasets_in
 
-        # 
-        tl.write(
-            f"|{input_len}|{output_len}|{throughput_requests}|{throughput_output_tokens}"
-            f"|{avg_per_token_latency*1000:.2f}|{avg_per_output_token_latency*1000:.2f}|"
-        )
+            sampled_datasets = datasets_combinations(
+                filtered_requests, int(args.obo_num), input_len, output_len
+            )
 
-        logger.info(f"\n{tl.text}")
+            logger.info(f"obo sampled datasets lengths:{len(sampled_datasets)}")
+
+            (
+                avg_per_token_latency,
+                avg_per_output_token_latency,
+            ) = send_request_one_by_one(
+                url=api_url,
+                backend=args.backend,
+                best_of=args.best_of,
+                use_beam_search=args.use_beam_search,
+                input_prompt_len=input_len,
+                max_new_tokens=output_len,
+                prompt_requests=sampled_datasets,
+            )
+            logger.info(
+                f"Begin benchmarks for input length:{input_len} and output length:{output_len}."
+            )
+
+            sampled_datasets = datasets_combinations(
+                filtered_requests, int(args.num_prompts), input_len, output_len
+            )
+
+            logger.info(f"batch sampled datasets lengths:{len(sampled_datasets)}")
+
+            benchmark_start_time = time.perf_counter()
+            asyncio.run(
+                benchmark(
+                    args.backend,
+                    api_url,
+                    sampled_datasets,
+                    args.best_of,
+                    args.use_beam_search,
+                    args.request_rate,
+                )
+            )
+            benchmark_end_time = time.perf_counter()
+            benchmark_time = benchmark_end_time - benchmark_start_time
+
+            # throughput_requests: Throughput (requests/s)
+            # throughput_output_tokens: Throughput (output token/s)
+            throughput_requests = f"{(args.num_prompts) / benchmark_time:.2f}"
+
+            # all output length / all time
+            throughput_output_tokens = f"{sum(GENERATED_TOKENS) / benchmark_time:.2f}"
+
+            GENERATED_TOKENS.clear()
+
+            tl.write(
+                f"|{input_len}|{output_len}|{throughput_requests}|{throughput_output_tokens}"
+                f"|{avg_per_token_latency*1000:.2f}|{avg_per_output_token_latency*1000:.2f}|"
+            )
+
+            logger.info(f"\n{tl.text}")
+
+        # reset datasets_in
+        datasets_in = None
 
     if args.output:
         tl.save(args.output)
@@ -429,7 +439,9 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(
         description="Benchmark the online serving throughput."
     )
-    parser.add_argument("--backend", type=str, default="vllm", choices=["vllm", "tgi","trt"])
+    parser.add_argument(
+        "--backend", type=str, default="vllm", choices=["vllm", "tgi", "trt"]
+    )
     parser.add_argument("--host", type=str, default="localhost")
     parser.add_argument("--port", type=int, default=8000)
     parser.add_argument(
