@@ -43,3 +43,14 @@
 |     2048     |      512      |          0.41           |           154.23            |             11.92              |                 94.03                 |
 |     2048     |     1024      |          0.37           |           204.42            |             17.48              |                 94.71                 |
 |     2048     |     2048      |          0.27           |           208.15            |             13.32              |                 94.26                 |
+
+
+
+## Throughput (Requests/s)
+![image](./throughput-req.png)
+## Throughput (Output Token/s)
+![image](./throughput-token-out.png)
+## Average Latency Per token/(ms)
+![image](./pertoken.png)
+## Average Latency Per Output Token(ms)
+![image](./per-out-token.png)
