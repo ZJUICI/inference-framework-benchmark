@@ -4,6 +4,11 @@
 
 ## vllm v0.2.5
 
+### Launching Command
+```sh
+python3 -m vllm.entrypoints.api_server --model <model dir> --port 8080 --disable-log-requests --quantization gptq
+```
+
 | Input Length | Output Length | Throughput (requests/s) | Throughput (output token/s) | Average latency per token (ms) | Average latency per output token (ms) |
 | :----------: | :-----------: | :---------------------: | :-------------------------: | :----------------------------: | :-----------------------------------: |
 |     128      |      128      |          16.01          |           2049.78           |              5.70              |                 11.40                 |
@@ -25,6 +30,11 @@
 
 ## tgi v1.3.4
 
+### Launching Command
+```sh
+text-generation-launcher --model-id <model name or path> --port 8080  --max-batch-prefill-tokens 4096 --max-input-length 4096 --max-total-tokens 8192 --max-concurrent-requests 1024 --quantize gptq
+```
+
 | Input Length | Output Length | Throughput (requests/s) | Throughput (output token/s) | Average latency per token (ms) | Average latency per output token (ms) |
 | :----------: | :-----------: | :---------------------: | :-------------------------: | :----------------------------: | :-----------------------------------: |
 |     128      |      128      |          3.51           |           356.18            |             40.29              |                 94.79                 |
@@ -43,3 +53,20 @@
 |     2048     |      512      |          0.41           |           154.23            |             11.92              |                 94.03                 |
 |     2048     |     1024      |          0.37           |           204.42            |             17.48              |                 94.71                 |
 |     2048     |     2048      |          0.27           |           208.15            |             13.32              |                 94.26                 |
+
+### Benchmark Command
+```sh
+# `obo-num` represents the number of one-by-one requests sent
+# `num-prompts` without `requests rate`, this will send all requests simultaneously.
+python3 -m benchmark.benchmark_serving --backend {tgi|vllm} --port 8080 --dataset ./ShareGPT_V3_unfiltered_cleaned_split.json  --tokenizer <model name or path> --obo-num 10 --input-lengths 128,512,1024,2048 --num-prompts 399 --output ./output/output.md
+```
+
+
+## Throughput (Requests/s)
+![image](./throughput-req.png)
+## Throughput (Output Token/s)
+![image](./throughput-token-out.png)
+## Average Latency Per token/(ms)
+![image](./pertoken.png)
+## Average Latency Per Output Token(ms)
+![image](./per-out-token.png)
